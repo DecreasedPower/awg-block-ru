@@ -11,7 +11,7 @@ RUNTIME_DIR="/run/${APP_NAME}"
 
 RU4_FILE="${STATE_DIR}/ru4.zone"
 RU6_FILE="${STATE_DIR}/ru6.zone"
-RULESET_FILE="${STATE_DIR}/rules.nft"
+CACHE_LINK="${STATE_DIR}/current"
 
 LOCK_FILE="/run/${APP_NAME}.lock"
 
@@ -28,11 +28,13 @@ TIMER_UNIT="${APP_NAME}-refresh.timer"
 
 LEGACY_HOUSEKEEPING_UNIT="${APP_NAME}-housekeeping.service"
 LEGACY_HOUSEKEEPING_TIMER="${APP_NAME}-housekeeping.timer"
+LEGACY_JOURNALD_DROPIN="/etc/systemd/journald.conf.d/${APP_NAME}-limits.conf"
 
 WATCH_INTERVAL_SECONDS=5
 LOCK_TIMEOUT_SECONDS=60
 
 TEMP_FILES=()
+PENDING_CACHE_DIR=""
 
 
 log() {
@@ -60,8 +62,16 @@ die() {
 
 cleanup_temp_files() {
 	local file
+	local current
 
-	for file in "${TEMP_FILES[@]}"; do
+	if [[ -n "$PENDING_CACHE_DIR" ]]; then
+		current="$(readlink "$CACHE_LINK" 2>/dev/null || true)"
+		if [[ "$current" != "${PENDING_CACHE_DIR##*/}" ]]; then
+			rm -rf -- "$PENDING_CACHE_DIR"
+		fi
+	fi
+
+	for file in ${TEMP_FILES[@]+"${TEMP_FILES[@]}"}; do
 		rm -f "$file" 2>/dev/null || true
 	done
 }
@@ -135,7 +145,7 @@ install_dependencies() {
 	local missing=false
 	local cmd
 
-	for cmd in curl nft ip nsenter flock; do
+	for cmd in curl nft ip nsenter flock python3; do
 		if ! command_exists "$cmd"; then
 			missing=true
 			break
@@ -161,7 +171,8 @@ install_dependencies() {
 		curl \
 		nftables \
 		iproute2 \
-		util-linux
+		util-linux \
+		python3
 }
 
 
@@ -287,59 +298,43 @@ find_awg_container() {
 }
 
 
-validate_ipv4_file() {
+validate_list() {
 	local file="$1"
-	local count
+	local version="$2"
+	local minimum="$3"
 
-	count="$(
-		grep -cve '^[[:space:]]*$' "$file" ||
-			true
-	)"
+	python3 - "$file" "$version" "$minimum" <<'PY'
+import ipaddress
+import re
+import sys
 
-	if [[ "$count" -lt 500 ]]; then
-		warn "IPv4 list looks too small: ${count} entries"
-		return 1
-	fi
+path, version, minimum = sys.argv[1:]
+version, minimum = int(version), int(minimum)
+count = 0
+with open(path, "rb") as file:
+    for line_number, line in enumerate(file, 1):
+        cidr = line.rstrip(b"\n")
+        try:
+            if not re.fullmatch(rb"[0-9A-Fa-f:.]+/(?:0|[1-9][0-9]{0,2})", cidr):
+                raise ValueError
+            if ipaddress.ip_network(cidr.decode("ascii"), strict=True).version != version:
+                raise ValueError
+        except ValueError:
+            sys.exit(f"Invalid IPv{version} CIDR in {path}, line {line_number}")
+        count += 1
 
-	if grep \
-		-Evm1 \
-		'^[0-9]{1,3}(\.[0-9]{1,3}){3}/([0-9]|[12][0-9]|3[0-2])$' \
-		"$file" \
-		>/dev/null; then
-
-		warn "IPv4 list contains unexpected data"
-		return 1
-	fi
-
-	return 0
+if count < minimum:
+    sys.exit(f"IPv{version} list looks too small: {count} entries (minimum {minimum})")
+PY
 }
 
 
-validate_ipv6_file() {
-	local file="$1"
-	local count
-
-	count="$(
-		grep -cve '^[[:space:]]*$' "$file" ||
-			true
-	)"
-
-	if [[ "$count" -lt 100 ]]; then
-		warn "IPv6 list looks too small: ${count} entries"
-		return 1
+select_cached_lists() {
+	# Older versions stored a pair of regular files directly in STATE_DIR.
+	if [[ -L "$CACHE_LINK" ]]; then
+		RU4_FILE="${CACHE_LINK}/ru4.zone"
+		RU6_FILE="${CACHE_LINK}/ru6.zone"
 	fi
-
-	if grep \
-		-Evm1 \
-		'^[0-9A-Fa-f:]+/([0-9]|[1-9][0-9]|1[01][0-9]|12[0-8])$' \
-		"$file" \
-		>/dev/null; then
-
-		warn "IPv6 list contains unexpected data"
-		return 1
-	fi
-
-	return 0
 }
 
 
@@ -352,15 +347,13 @@ lists_exist() {
 
 
 download_lists() {
+	local destination="$1"
 	local tmp4
 	local tmp6
 
-	prepare_directories
-
 	tmp4="$(mktemp "${RUNTIME_DIR}/ru4.XXXXXX")"
-	tmp6="$(mktemp "${RUNTIME_DIR}/ru6.XXXXXX")"
-
 	register_temp_file "$tmp4"
+	tmp6="$(mktemp "${RUNTIME_DIR}/ru6.XXXXXX")"
 	register_temp_file "$tmp6"
 
 	log "Downloading RU IPv4 list from IPdeny"
@@ -399,55 +392,23 @@ download_lists() {
 		return 1
 	fi
 
-	sed -i 's/\r$//' "$tmp4"
-	sed -i 's/\r$//' "$tmp6"
-
-	if ! validate_ipv4_file "$tmp4"; then
-		return 1
-	fi
-
-	if ! validate_ipv6_file "$tmp6"; then
-		return 1
-	fi
-
-	install \
-		-m 0644 \
-		"$tmp4" \
-		"${RU4_FILE}.new"
-
-	install \
-		-m 0644 \
-		"$tmp6" \
-		"${RU6_FILE}.new"
-
-	mv \
-		"${RU4_FILE}.new" \
-		"$RU4_FILE"
-
-	mv \
-		"${RU6_FILE}.new" \
-		"$RU6_FILE"
-
-	log "Lists updated: IPv4=$(wc -l < "$RU4_FILE"), IPv6=$(wc -l < "$RU6_FILE")"
-
-	return 0
+	sed -e $'s/\r$//' -e '/^[[:space:]]*$/d' "$tmp4" > "${destination}/ru4.zone"
+	sed -e $'s/\r$//' -e '/^[[:space:]]*$/d' "$tmp6" > "${destination}/ru6.zone"
 }
 
 
 build_ruleset() {
-	local tmp_ruleset
+	local ru4="$1"
+	local ru6="$2"
+	local ruleset="$3"
 
-	validate_ipv4_file "$RU4_FILE" ||
-		die "Cached IPv4 list is invalid"
-
-	validate_ipv6_file "$RU6_FILE" ||
-		die "Cached IPv6 list is invalid"
-
-	tmp_ruleset="${RULESET_FILE}.tmp.$$"
-
-	register_temp_file "$tmp_ruleset"
+	validate_list "$ru4" 4 500
+	validate_list "$ru6" 6 100
 
 	{
+		# "add" succeeds even if this table already exists.
+		printf 'add table inet %s\n' "$TABLE_NAME"
+		printf 'delete table inet %s\n' "$TABLE_NAME"
 		printf 'table inet %s {\n' "$TABLE_NAME"
 
 		printf '\tset ru4 {\n'
@@ -467,7 +428,7 @@ build_ruleset() {
 			END {
 				printf " }\n"
 			}
-		' "$RU4_FILE"
+		' "$ru4"
 
 		printf '\t}\n'
 
@@ -490,7 +451,7 @@ build_ruleset() {
 			END {
 				printf " }\n"
 			}
-		' "$RU6_FILE"
+		' "$ru6"
 
 		printf '\t}\n'
 
@@ -510,11 +471,7 @@ build_ruleset() {
 		printf '\t}\n'
 
 		printf '}\n'
-	} > "$tmp_ruleset"
-
-	mv \
-		"$tmp_ruleset" \
-		"$RULESET_FILE"
+	} > "$ruleset"
 }
 
 
@@ -540,48 +497,38 @@ chain_active() {
 }
 
 
-create_atomic_batch() {
-	local pid="$1"
-	local batch_file="$2"
-
-	if table_active "$pid"; then
-		{
-			printf 'delete table inet %s\n' "$TABLE_NAME"
-			cat "$RULESET_FILE"
-		} > "$batch_file"
-	else
-		cp \
-			"$RULESET_FILE" \
-			"$batch_file"
-	fi
-}
-
-
 apply_rules() {
 	local refresh="${1:-false}"
 	local container
 	local pid
 	local batch_file
+	local ru4
+	local ru6
+	local previous_cache=""
 
 	require_root
 	prepare_directories
-	check_free_space
 	acquire_lock
 	check_docker
 
-	if [[ "$refresh" == true ]]; then
-		if ! download_lists; then
-			if lists_exist; then
-				warn "Could not refresh lists; keeping cached lists"
-			else
-				die "Could not download RU lists and no cached copy exists"
-			fi
-		fi
-	elif ! lists_exist; then
-		if ! download_lists; then
-			die "RU lists are missing and download failed"
-		fi
+	select_cached_lists
+	ru4="$RU4_FILE"
+	ru6="$RU6_FILE"
+
+	if [[ "$refresh" == true ]] || ! lists_exist; then
+		check_free_space
+		previous_cache="$(readlink "$CACHE_LINK" 2>/dev/null || true)"
+		PENDING_CACHE_DIR="$(mktemp -d "${STATE_DIR}/cache.XXXXXX")"
+		download_lists "$PENDING_CACHE_DIR"
+		ru4="${PENDING_CACHE_DIR}/ru4.zone"
+		ru6="${PENDING_CACHE_DIR}/ru6.zone"
+		# Prepare the next symlink on the same filesystem for an atomic rename.
+		ln -s "${PENDING_CACHE_DIR##*/}" "${PENDING_CACHE_DIR}/current"
 	fi
+
+	batch_file="$(mktemp "${RUNTIME_DIR}/apply.XXXXXX")"
+	register_temp_file "$batch_file"
+	build_ruleset "$ru4" "$ru6" "$batch_file"
 
 	container="$(find_awg_container)" ||
 		die "Running AmneziaWG container with interface ${AWG_IFACE} was not found"
@@ -590,19 +537,6 @@ apply_rules() {
 		die "Could not obtain PID for container ${container}"
 
 	log "Using container=${container}, pid=${pid}, interface=${AWG_IFACE}"
-
-	build_ruleset
-
-	batch_file="$(
-		mktemp \
-			"${RUNTIME_DIR}/apply.XXXXXX"
-	)"
-
-	register_temp_file "$batch_file"
-
-	create_atomic_batch \
-		"$pid" \
-		"$batch_file"
 
 	#
 	# Проверяем полный batch до применения.
@@ -642,6 +576,17 @@ apply_rules() {
 		die "Blocking chain ${TABLE_NAME}/forward was not created"
 	fi
 
+	if [[ -n "$PENDING_CACHE_DIR" ]]; then
+		mv -Tf "${PENDING_CACHE_DIR}/current" "$CACHE_LINK"
+		PENDING_CACHE_DIR=""
+
+		if [[ "$previous_cache" =~ ^cache\.[a-zA-Z0-9]{6}$ ]]; then
+			rm -rf -- "${STATE_DIR}/${previous_cache}"
+		fi
+
+		log "Lists updated: IPv4=$(wc -l < "$ru4"), IPv6=$(wc -l < "$ru6")"
+	fi
+
 	log "RU IPv4/IPv6 blocking is active for traffic entering via ${AWG_IFACE}"
 }
 
@@ -654,7 +599,7 @@ watch_mode() {
 
 	require_root
 	prepare_directories
-	check_docker
+	command_exists docker || die "docker command not found"
 
 	log "Starting AmneziaWG firewall watcher"
 
@@ -741,6 +686,11 @@ remove_legacy_housekeeping() {
 	rm -f \
 		"/etc/systemd/system/timers.target.wants/${LEGACY_HOUSEKEEPING_TIMER}" \
 		"/etc/systemd/system/multi-user.target.wants/${LEGACY_HOUSEKEEPING_UNIT}"
+
+	if [[ -f "$LEGACY_JOURNALD_DROPIN" ]]; then
+		rm -f "$LEGACY_JOURNALD_DROPIN"
+		systemctl restart systemd-journald
+	fi
 }
 
 
@@ -761,9 +711,8 @@ write_systemd_units() {
 	cat > "/etc/systemd/system/${WATCH_UNIT}" <<EOF
 [Unit]
 Description=Maintain Russian IP blocking for AmneziaWG clients
-Requires=docker.service
 After=docker.service network-online.target
-Wants=network-online.target
+Wants=docker.service network-online.target
 
 [Service]
 Type=simple
@@ -873,6 +822,8 @@ status_mode() {
 
 	printf 'Cached lists:\n'
 
+	select_cached_lists
+
 	if [[ -f "$RU4_FILE" ]]; then
 		printf \
 			'  IPv4: %s entries, %s\n' \
@@ -889,12 +840,6 @@ status_mode() {
 			"$(du -h "$RU6_FILE" | awk '{ print $1 }')"
 	else
 		printf '  IPv6: missing\n'
-	fi
-
-	if [[ -f "$RULESET_FILE" ]]; then
-		printf \
-			'  Rules: %s\n' \
-			"$(du -h "$RULESET_FILE" | awk '{ print $1 }')"
 	fi
 
 	printf \
@@ -963,7 +908,15 @@ install_mode() {
 	#
 	log "Downloading lists and applying firewall rules"
 
-	"$INSTALL_PATH" apply --refresh
+	select_cached_lists
+	if lists_exist; then
+		if ! "$INSTALL_PATH" apply --refresh; then
+			warn "Could not refresh lists; applying the previous cache"
+			"$INSTALL_PATH" apply
+		fi
+	else
+		"$INSTALL_PATH" apply --refresh
+	fi
 
 	log "Initial firewall installation verified"
 
@@ -1039,12 +992,10 @@ remove_mode() {
 	rm -f \
 		"/etc/systemd/system/${WATCH_UNIT}" \
 		"/etc/systemd/system/${REFRESH_UNIT}" \
-		"/etc/systemd/system/${TIMER_UNIT}" \
-		"/etc/systemd/system/${LEGACY_HOUSEKEEPING_UNIT}" \
-		"/etc/systemd/system/${LEGACY_HOUSEKEEPING_TIMER}"
+		"/etc/systemd/system/${TIMER_UNIT}"
 
+	remove_legacy_housekeeping
 	systemctl daemon-reload
-	systemctl reset-failed >/dev/null 2>&1 || true
 
 	rm -rf "$STATE_DIR"
 	rm -rf "$RUNTIME_DIR"
@@ -1077,6 +1028,11 @@ Refresh logs:
 
 Remove:
 	sudo ${INSTALL_PATH} remove
+
+Disk settings:
+	No host-wide disk cleanup is scheduled. Install and remove clean up this
+	script's legacy housekeeping units and journald drop-in, if present.
+	If an older version modified /etc/docker/daemon.json, review it manually.
 EOF
 }
 
